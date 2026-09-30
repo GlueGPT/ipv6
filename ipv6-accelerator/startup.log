@@ -1,0 +1,14 @@
+==== IPv6 加速器启动日志 ====
+时间: 2026/9/30 21:48:13
+Node: v24.20.0 (C:\Program Files\nodejs\node.exe)
+平台: win32 10.0.26200
+脚本目录: C:\Users\32738\Desktop\ipv6-accelerator
+工作目录: C:\Users\32738\Desktop\ipv6-accelerator
+原始参数: []
+------------------------------
+[2026-09-30T13:48:13.269Z] launcher.js 开始执行（说明 node 能正常启动、launcher.js 能被读到）
+[2026-09-30T13:48:13.269Z] 解析参数: port=8899 proxy=false open=true 传给 server.js: ["--port","8899"]
+[2026-09-30T13:48:13.270Z] 探测已有实例: pid文件 / 8900 / 8899
+[2026-09-30T13:48:13.270Z] PID 文件: {"service":"ipv6-accelerator","version":"1.0.0","pid":15508,"proxyPort":8899,"uiPort":8900,"host":"127.0.0.1","startedAt":"2026-09-30T13:45:54.311Z"}  进程存活=true
+[2026-09-30T13:48:13.282Z] 检测到已有实例 pid=15508（pid文件），打开浏览器后退出。这是正常结束，不是闪退。
+node exit code: 0 

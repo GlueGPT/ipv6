@@ -1,0 +1,28 @@
+{
+  "name": "ipv6-accelerator",
+  "version": "1.0.0",
+  "description": "IPv6 通用下载加速器 —— 多候选 IP 竞速 + 实测吞吐优选 + 本地代理（不改 hosts）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node launcher.js",
+    "start:proxy": "node launcher.js --proxy",
+    "restore-proxy": "node restore-proxy.js",
+    "build:launchers": "node make-launchers.js",
+    "serve": "node server.js",
+    "cli": "node cli.js",
+    "env": "node cli.js --env",
+    "test": "node test-probe.js && node test-e2e.js",
+    "test:probe": "node test-probe.js",
+    "test:e2e": "node test-e2e.js"
+  },
+  "bin": {
+    "ipv6-accel": "cli.js"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "dependencies": {},
+  "keywords": ["ipv6", "proxy", "download", "accelerator", "cdn", "happy-eyeballs"],
+  "license": "MIT",
+  "private": true
+}
