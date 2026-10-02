@@ -26,7 +26,14 @@ const path = require('path');
 // ==== 只维护这里，改完重新生成 ====
 
 /**
- * 两个入口脚本内容完全相同，只靠 --proxy 参数区分行为。
+ * 唯一入口脚本。
+ *
+ * 设计原则：这个文件里只有 ASCII，且只做一件事 —— 找到 Node.js 然后把活交出去。
+ * 所有中文提示、模式选择、提权、实例替换都在 launcher.js 里做。
+ *
+ * 历史教训：曾经有 5 个 .cmd 各自都能启动程序，用户连续踩了两次坑 ——
+ * 一次是"先用 start.cmd 起过，再用管理员脚本时被已有实例劝退，管理员权限根本没生效"。
+ * 入口越少越不容易出错，所以现在只保留 start.cmd 和救援用的 restore-proxy.cmd。
  * 保持 ASCII，不要在这里加中文（原因见文件头注释）。
  */
 const LAUNCHER_CMD = `@echo off
@@ -89,21 +96,14 @@ rem pass node's exit code through (pause overwrites ERRORLEVEL, hence RC)
 exit /b %RC%
 `;
 
-const START_BODY = LAUNCHER_CMD;
-const PROXY_BODY = LAUNCHER_CMD.replace(
-  '"%~dp0launcher.js" %*',
-  '"%~dp0launcher.js" --proxy %*'
-);
-// 还原脚本：只把入口换成 restore-proxy.js，其余（含日志与 pause）保持一致
+// 救援脚本：把入口换成 restore-proxy.js，其余保持完全一致
 const RESTORE_BODY = LAUNCHER_CMD.replace(
   '"%~dp0launcher.js" %*',
   '"%~dp0restore-proxy.js"'
 );
 
 const files = [
-  { name: 'start.cmd', content: START_BODY },
-  { name: 'start-ascii.cmd', content: START_BODY },
-  { name: '一键开启系统代理.cmd', content: PROXY_BODY },
+  { name: 'start.cmd', content: LAUNCHER_CMD },
   { name: 'restore-proxy.cmd', content: RESTORE_BODY },
 ];
 

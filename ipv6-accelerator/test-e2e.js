@@ -147,7 +147,12 @@ async function waitReady(port, tries = 40, gapMs = 500) {
 
   // --- 3. 优选测速（双栈目标） ---
   console.log(`\n${C.b}[3] 优选测速 API（双栈目标）${C.r}`);
-  const TARGET = 'https://mirrors.zju.edu.cn/ubuntu/ls-lR.gz';
+  // 目标可通过环境变量覆盖：换网络（宽带/热点）后镜像的可达性与速度都会变，
+  // 写死一个地址会让整个测试在新网络下卡到超时。
+  const TARGET = process.env.ACCEL_TEST_TARGET
+    || 'https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ls-lR.gz';
+  const TARGET_HOST = new URL(TARGET).hostname;
+  console.log(`     ${C.d}测试目标: ${TARGET}${C.r}`);
   const pr = await req(UI_PORT, '/api/probe', { target: TARGET, doSpeed: true });
   if (pr.json && pr.json.rows) {
     const { rows, v4, v6 } = pr.json;
@@ -193,7 +198,7 @@ async function waitReady(port, tries = 40, gapMs = 500) {
   let refined = null;
   for (let i = 0; i < 30; i++) {
     const r = await req(UI_PORT, '/api/route');
-    const rec = (r.json.routes || []).find((x) => x.hostname === 'mirrors.zju.edu.cn');
+    const rec = (r.json.routes || []).find((x) => x.hostname === TARGET_HOST);
     if (rec && rec.speedDone) { refined = rec; break; }
     await new Promise((x) => setTimeout(x, 700));
   }
@@ -218,8 +223,8 @@ async function waitReady(port, tries = 40, gapMs = 500) {
       for (const r of s.routes) {
         console.log(`     ${C.d}路由: ${r.hostname}  主用 ${r.primary}  竞速 [${(r.raceOrder || []).join(', ')}]  命中 ${r.hits}${C.r}`);
       }
-      const hit = s.routes.find((r) => r.hostname === 'mirrors.zju.edu.cn');
-      hit && hit.primary ? ok(`mirrors.zju.edu.cn 已建立优选路由，主用 ${hit.primary}`) : bad('没有该域名的路由记录');
+      const hit = s.routes.find((r) => r.hostname === TARGET_HOST);
+      hit && hit.primary ? ok(`${TARGET_HOST} 已建立优选路由，主用 ${hit.primary}`) : bad('没有该域名的路由记录');
     } else bad('路由表为空');
     const byIp = s.byIp || [];
     byIp.length ? ok(`实际承载流量的 IP: ${byIp.map((e) => `${e.ip}(v${e.family},${(e.bytesDown / 1048576).toFixed(1)}MB)`).join('  ')}`) : bad('没有 byIp 统计');

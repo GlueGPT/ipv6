@@ -23,6 +23,7 @@ const http = require('http');
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
 const { spawn, exec } = require('child_process');
 
 // ---------------------------------------------------------------------------
@@ -60,19 +61,33 @@ const DEFAULT_PORT = 8899;
 const C = { r: '\x1b[0m', d: '\x1b[2m', b: '\x1b[1m', g: '\x1b[32m', y: '\x1b[33m', red: '\x1b[31m', cyan: '\x1b[36m' };
 
 function parseArgs(argv) {
-  const a = { port: DEFAULT_PORT, open: true, proxy: false, rest: [] };
+  const a = { port: DEFAULT_PORT, open: true, proxy: false, elevate: false, rest: [] };
   for (let i = 2; i < argv.length; i++) {
     const k = argv[i];
     if (k === '--port' || k === '-p') { a.port = Number(argv[++i]); }
     else if (k === '--no-open') { a.open = false; }
-    else if (k === '--proxy') { a.proxy = true; }     // 顺带设置系统代理（退出还原）
+    else if (k === '--proxy') { a.proxy = true; }      // 顺带设置系统代理（退出还原）
+    else if (k === '--elevate') { a.elevate = true; }  // 以管理员身份重新启动
+    else if (k === '--help' || k === '-h') { a.help = true; }
     else a.rest.push(k);
   }
   a.rest.unshift('--port', String(a.port));
+  // 告诉服务端"系统代理已指向本加速器"，界面据此显示浏览器模式状态
+  if (a.proxy) a.rest.push('--system-proxy');
   return a;
 }
 
-const ARGS = parseArgs(process.argv);
+/**
+ * 应用参数。
+ *
+ * 之所以做成"可覆盖"而不是一次性 const：
+ * 交互菜单是在解析之后才决定要加哪些参数的（比如用户选了管理员+系统代理），
+ * 加载时就锁死 ARGS 会让菜单根本没地方生效。
+ */
+let ARGS = parseArgs(process.argv);
+function applyArgs(extra) {
+  ARGS = parseArgs([process.argv[0], process.argv[1], ...extra]);
+}
 logLine(`解析参数: port=${ARGS.port} proxy=${ARGS.proxy} open=${ARGS.open} 传给 server.js: ${JSON.stringify(ARGS.rest)}`);
 
 /**
@@ -240,11 +255,326 @@ async function applyRestore(saved) {
   else await regDelete('ProxyOverride');
 }
 
+/**
+ * 停掉一个正在运行的加速器实例。
+ *
+ * 用在 --elevate 场景：用户之前可能用普通权限启动过，
+ * 这时必须先把旧实例停掉，否则新实例会撞端口、
+ * 或者被"检测到已在运行"直接劝退 —— 结果就是管理员权限根本没生效。
+ *
+ * 先试 SIGTERM（让它自己走完还原系统代理的收尾流程），
+ * 不行再强杀，最后确认端口真的释放了。
+ */
+async function stopExistingInstance(pid) {
+  const graceful = () => { try { process.kill(pid, 'SIGTERM'); return true; } catch (_) { return false; } };
+  const forceful = () => { try { process.kill(pid, 'SIGKILL'); return true; } catch (_) { return false; } };
+
+  if (!graceful()) return false;
+
+  // 给它 4 秒做收尾（还原 hosts、还原系统代理）
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    if (!pidAlive(pid)) return true;
+  }
+
+  logLine(`pid ${pid} 没有响应 SIGTERM，强制结束`);
+  forceful();
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    if (!pidAlive(pid)) return true;
+  }
+
+  // 还活着就只能交给端口预检去报错了
+  return !pidAlive(pid);
+}
+
+/**
+ * 换掉正在运行的实例：停掉旧的、把它的启动包裹进程也结束掉、清掉 PID 文件。
+ * 返回是否成功腾出位置。
+ */
+async function replaceExistingInstance(found) {
+  console.log(`  ${C.d}正在停掉旧实例（pid ${found.pid}）……${C.r}`);
+  logLine(`--elevate：准备停掉旧实例 pid=${found.pid}`);
+
+  const stopped = await stopExistingInstance(found.pid);
+  if (!stopped) {
+    logLine(`旧实例 pid=${found.pid} 无法结束`);
+    console.log(`  ${C.red}✗ 无法结束旧实例（pid ${found.pid}）。${C.r}`);
+    console.log(`  ${C.d}请手动结束它：任务管理器 → 详细信息 → 找 node.exe (pid ${found.pid})。${C.r}`);
+    console.log('');
+    return false;
+  }
+
+  // 旧实例是通过 start.cmd → launcher.js → server.js 启动的。
+  // server.js 没了，包着它的 launcher.js 会自己退出，但可能还在等端口，
+  // 这里再等一小会儿并清掉 PID 文件，避免新实例被自己的残留记录劝退。
+  try {
+    const stale = readPidFileInfo();
+    if (stale && stale.pid === found.pid) {
+      const p = path.join(__dirname, 'accelerator.pid');
+      try { fs.unlinkSync(p); logLine('已清理旧 PID 文件'); } catch (_) {}
+    }
+  } catch (_) {}
+
+  // 等端口真正释放（TIME_WAIT 不影响 listen，但监听 socket 需要时间关闭）
+  for (let i = 0; i < 30; i++) {
+    const busy = await probeTcp(ARGS.port, 300) || await probeTcp(ARGS.port + 1, 300);
+    if (!busy) return true;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  logLine('端口等待超时，仍继续尝试启动');
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 交互式启动菜单
+//
+// 只在"双击启动"的场景下出现：没有任何命令行参数 + 有真实控制台 + 未被显式禁用。
+// 脚本调用（带参数）时一律不弹菜单，避免影响自动化。
+// ---------------------------------------------------------------------------
+const MENU_MODE_ARGS = {
+  1: [],                                        // 普通启动
+  2: ['--proxy'],                               // 加速启动（顺带设置系统代理）
+  3: ['--elevate', '--proxy'],                  // 管理员 + 系统代理
+  4: ['--elevate'],                             // 管理员，不动系统代理
+};
+
+function shouldShowMenu() {
+  if (process.argv.length > 2) return false;              // 有参数 → 脚本调用
+  if (process.env.ACCEL_NO_MENU === '1') return false;    // 显式禁用
+  if (process.env.ACCEL_FORCE_MENU === '1') return true;  // 显式强制（测试用）
+  if (!process.stdout.isTTY) return false;                // 非交互环境（管道/重定向）
+  return true;
+}
+
+/**
+ * 读一行输入。
+ *
+ * 有真实控制台时用 readline 交互读；
+ * stdin 是管道时（`echo 2 | node launcher.js`）readline 收不到，
+ * 改用同步读 —— 这样菜单逻辑才可能被自动化测试覆盖。
+ */
+function ask(question) {
+  if (!process.stdin.isTTY) {
+    process.stdout.write(question);
+    try {
+      const buf = fs.readFileSync(0, 'utf8');
+      const line = String(buf).split(/\r?\n/)[0] || '';
+      process.stdout.write(line + '\n');
+      return Promise.resolve(line.trim());
+    } catch (_) {
+      return Promise.resolve('');
+    }
+  }
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (ans) => { rl.close(); resolve(String(ans || '').trim()); });
+  });
+}
+
+/** 读取当前系统代理是否指向本加速器，用于菜单里显示"加速已开启" */
+function systemProxyPointsHere(port) {
+  return new Promise((resolve) => {
+    exec(
+      'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyServer',
+      { windowsHide: true },
+      (err, stdout) => {
+        if (err) return resolve(false);
+        resolve(String(stdout).includes(`127.0.0.1:${port}`));
+      }
+    );
+  });
+}
+
+async function showMenu(uiPort) {
+  const { isElevated } = require('./elevate');
+  const elevated = isElevated();
+  const hosts = require('./lib/hosts');
+  const writable = hosts.canWrite();
+  const proxyOn = await systemProxyPointsHere(ARGS.port);
+
+  console.log('');
+  console.log(`  ${C.b}${C.cyan}IPv6 通用下载加速器${C.r}`);
+  console.log('');
+  console.log(`  ${C.d}当前状态：${C.r}` +
+    `管理员 ${elevated ? C.g + '是' + C.r : C.y + '否' + C.r}   ` +
+    `hosts 可写 ${writable.ok ? C.g + '是' + C.r : C.y + '否' + C.r}   ` +
+    `系统代理 ${proxyOn ? C.g + '已开启' + C.r : C.d + '未开启' + C.r}`);
+  console.log('');
+
+  if (!elevated) {
+    console.log(`  ${C.d}提示：游戏平台（Steam / Epic 等）需要管理员权限；${C.r}`);
+    console.log(`  ${C.d}      浏览器和 IDM 的代理模式不需要，选 1 或 2 即可。${C.r}`);
+    console.log('');
+  }
+
+  console.log(`  ${C.b}[1]${C.r} 普通启动`);
+  console.log(`      ${C.d}只开界面。浏览器 / IDM 手动填代理 127.0.0.1:${ARGS.port}${C.r}`);
+  console.log(`  ${C.b}[2]${C.r} 加速启动 ${C.g}（推荐）${C.r}`);
+  console.log(`      ${C.d}自动把系统代理指向本程序，浏览器 / IDM 立刻生效${C.r}`);
+  console.log(`      ${C.d}退出时自动还原原来的代理设置${C.r}`);
+  console.log(`  ${C.b}[3]${C.r} 加速启动 + 管理员权限`);
+  console.log(`      ${C.d}上面的功能，外加游戏平台模式（Steam / Epic / 战网……）${C.r}`);
+  console.log(`  ${C.b}[4]${C.r} 管理员启动，不动系统代理`);
+  console.log(`      ${C.d}只想用游戏平台模式、不想改系统代理时选这个${C.r}`);
+  console.log(`  ${C.b}[h]${C.r} 查看命令行用法`);
+  console.log(`  ${C.b}[q]${C.r} 退出`);
+  console.log('');
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const ans = (await ask(`  ${C.b}请选择 [1/2/3/4/h/q]（直接回车 = 2 加速启动）：${C.r}`)).toLowerCase();
+
+    if (ans === '' || ans === '2') return { args: MENU_MODE_ARGS[2] };
+    if (ans === '1') return { args: MENU_MODE_ARGS[1] };
+    if (ans === '3') return { args: MENU_MODE_ARGS[3] };
+    if (ans === '4') return { args: MENU_MODE_ARGS[4] };
+    if (ans === 'q' || ans === 'exit') return { exit: true };
+    if (ans === 'h' || ans === 'help' || ans === '--help') return { help: true };
+
+    console.log(`  ${C.y}没看懂「${ans}」，请输入 1 / 2 / 3 / 4 / h / q${C.r}`);
+  }
+
+  console.log(`  ${C.d}多次输入无效，按默认（2 加速启动）继续。${C.r}`);
+  return { args: MENU_MODE_ARGS[2] };
+}
+
+function printCliHelp() {
+  console.log(`
+  ${C.b}命令行用法${C.r}
+
+    start.cmd                    双击用：弹出上面的菜单
+    start.cmd --proxy            加速启动（自动设置系统代理，退出还原）
+    start.cmd --elevate          管理员启动（游戏平台模式需要）
+    start.cmd --elevate --proxy  管理员 + 系统代理
+    start.cmd --port 9000        换端口（界面端口自动为 9001）
+    start.cmd --no-open          启动但不自动开浏览器
+    start.cmd --policy v6        默认只走 IPv6
+
+  ${C.b}命令行测速（不用开界面）${C.r}
+
+    node cli.js --env            查看本机 IPv6 环境
+    node cli.js <域名或URL>      对比该目标的 IPv4 / IPv6 实测速度
+    node cli.js <URL> --quick    只测延迟
+    node cli.js <URL> --json     输出 JSON
+
+  ${C.b}出问题时${C.r}
+
+    先看 ${C.b}startup.log${C.r} —— 里面记录了完整的启动过程和错误原因
+    系统代理卡住导致上不了网 → 双击 ${C.b}restore-proxy.cmd${C.r}
+`);
+}
+
+/**
+ * 派一个独立的看门狗进程，负责在"非正常退出"时兜底还原系统代理。
+ *
+ * 为什么要独立进程：实测确认 Windows 上
+ *   - 任务管理器结束进程
+ *   - 外部 process.kill 发 SIGINT/SIGTERM（直接 TerminateProcess，
+ *     signal handler 和 exit 事件都不会触发）
+ *   - 关闭控制台窗口
+ * 这三种情况下本进程的收尾代码**完全没有机会执行**。
+ * 必须在外面留一个"目击者"。
+ *
+ * detached + unref：看门狗要能活过本进程，但不能拖住本进程退出。
+ */
+function startWatchdog(token) {
+  try {
+    const wd = spawn(process.execPath, [
+      path.join(__dirname, 'watchdog.js'),
+      '--pid', String(process.pid),
+      '--token', token,
+    ], {
+      cwd: __dirname,
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    wd.unref();
+    return wd.pid;
+  } catch (e) {
+    logLine(`[警告] 看门狗启动失败: ${e.message}`);
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
 async function main() {
+  // ---- 双击启动时先弹交互菜单 ----
+  // 只在"没有参数 + 真实控制台"时出现，脚本调用一律跳过。
+  if (shouldShowMenu()) {
+    const choice = await showMenu(ARGS.port + 1);
+    if (choice.exit) {
+      logLine('用户在菜单选择退出');
+      process.exit(0);
+    }
+    if (choice.help) {
+      printCliHelp();
+      logLine('用户在菜单查看帮助');
+      const again = await ask(`  ${C.d}按回车退出……${C.r}`);
+      void again;
+      process.exit(0);
+    }
+    if (choice.args) {
+      applyArgs([...choice.args, '--port', String(ARGS.port)]);
+      logLine(`菜单选择生效: proxy=${ARGS.proxy} elevate=${ARGS.elevate}`);
+    }
+  }
+
+  if (ARGS.help) { printCliHelp(); process.exit(0); }
+
   const uiPort = ARGS.port + 1;
+
+  // ---- 需要管理员权限时，先提权再继续 ----
+  //
+  // Steam / Epic 这类模式必须写 hosts，而写 hosts 需要管理员。
+  // 与其让用户自己去"右键 → 以管理员身份运行"，不如直接弹一次 UAC。
+  if (ARGS.elevate) {
+    const { isElevated, relaunchAsAdmin } = require('./elevate');
+    if (isElevated()) {
+      logLine('已具备管理员权限，继续正常启动');
+      console.log(`  ${C.g}✓ 已以管理员身份运行，hosts 模式（Steam / Epic 等）可以正常使用。${C.r}`);
+    } else {
+      console.log('');
+      console.log(`  ${C.y}即将弹出管理员授权（UAC）对话框，请点「是」。${C.r}`);
+      console.log(`  ${C.d}hosts 模式（Steam / Epic / EA 等）需要管理员权限才能写入。${C.r}`);
+      console.log('');
+      logLine('请求提权重启');
+      // 必须把 --elevate 摘掉再传下去，否则万一 isElevated() 判断不准就会无限弹 UAC
+      const forward = process.argv.slice(2).filter((x) => x !== '--elevate' && x !== '--no-open');
+      const r = await relaunchAsAdmin(forward);
+      if (r.ok) {
+        logLine('提权成功，已在新窗口启动，本进程退出');
+        console.log(`  ${C.g}✓ 已在新的管理员窗口中启动加速器。${C.r}`);
+        console.log(`  ${C.d}这个窗口可以关掉了，请看新弹出的窗口。${C.r}`);
+        console.log('');
+        process.exit(0);
+      }
+      logLine(`提权失败: ${r.error}`);
+      console.log(`  ${C.red}✗ 提权失败：${r.error}${C.r}`);
+      console.log('');
+      console.log('  你可以：');
+      console.log('    1. 继续用普通权限运行（浏览器代理模式仍然完全可用）');
+      console.log('    2. 或者手动：右键 start.cmd → 以管理员身份运行');
+      console.log('');
+      // 不直接退出，让用户仍然能用代理模式
+      console.log(`  ${C.d}3 秒后按普通权限继续启动……${C.r}`);
+      await new Promise((r2) => setTimeout(r2, 3000));
+    }
+  } else {
+    // 没要求提权，但提醒一下 hosts 模式会不可用
+    try {
+      const hosts = require('./lib/hosts');
+      const w = hosts.canWrite();
+      if (!w.ok) {
+        logLine(`hosts 不可写: ${w.error}`);
+        console.log(`  ${C.d}提示：当前不是管理员权限，hosts 模式（Steam / Epic）不可用；${C.r}`);
+        console.log(`  ${C.d}      浏览器代理模式不受影响。需要 hosts 模式请双击「以管理员身份运行.cmd」。${C.r}`);
+        console.log('');
+      }
+    } catch (_) {}
+  }
 
   // ---- 已经在跑？直接开界面，不当成错误 ----
   //
@@ -277,17 +607,41 @@ async function main() {
   }
 
   if (found) {
-    console.log('');
-    console.log(`  ${C.g}加速器已经在运行中${C.r}（pid ${found.pid}，通过${found.via}确认）`);
-    console.log(`  ${C.d}界面地址：http://127.0.0.1:${found.uiPort}${C.r}`);
-    console.log(`  ${C.d}代理地址：http://127.0.0.1:${found.proxyPort}${C.r}`);
-    console.log('');
-    console.log(`  ${C.d}不需要重复启动，已帮你打开界面。${C.r}`);
-    console.log(`  ${C.d}要停掉它：在那个黑窗口里按 Ctrl+C，或用任务管理器结束 pid ${found.pid}。${C.r}`);
-    console.log('');
-    openBrowser(`http://127.0.0.1:${found.uiPort}`);
-    logLine(`检测到已有实例 pid=${found.pid}（${found.via}），打开浏览器后退出。这是正常结束，不是闪退。`);
-    process.exit(0);
+    // 用 --elevate 启动时，用户是明确想"换成管理员实例"。
+    // 这时不能只是打开浏览器就退出 —— 那样管理员权限根本没生效，
+    // 用户会以为提权成功了、界面却仍然显示"需要管理员"。
+    if (ARGS.elevate) {
+      console.log('');
+      console.log(`  ${C.y}检测到已有实例（pid ${found.pid}），正在替换为管理员实例……${C.r}`);
+      console.log(`  ${C.d}因为 hosts 模式需要管理员权限，旧的非管理员实例必须让位。${C.r}`);
+      console.log('');
+      const freed = await replaceExistingInstance(found);
+      if (!freed) {
+        console.log(`  ${C.red}请先手动结束旧实例，再重新运行「以管理员身份运行.cmd」。${C.r}`);
+        console.log('');
+        process.exit(1);
+      }
+      console.log(`  ${C.g}✓ 旧实例已停止，继续以管理员身份启动。${C.r}`);
+      console.log('');
+      // 落到下面正常启动流程
+    } else {
+      console.log('');
+      console.log(`  ${C.g}加速器已经在运行中${C.r}（pid ${found.pid}，通过${found.via}确认）`);
+      console.log(`  ${C.d}界面地址：http://127.0.0.1:${found.uiPort}${C.r}`);
+      console.log(`  ${C.d}代理地址：http://127.0.0.1:${found.proxyPort}${C.r}`);
+      console.log('');
+      console.log(`  ${C.d}不需要重复启动，已帮你打开界面。${C.r}`);
+      console.log(`  ${C.d}要停掉它：在那个黑窗口里按 Ctrl+C，或用任务管理器结束 pid ${found.pid}。${C.r}`);
+      if (ARGS.proxy) {
+        console.log('');
+        console.log(`  ${C.y}注意：你用的是「一键开启系统代理」，但当前实例不是它启动的，${C.r}`);
+        console.log(`  ${C.y}      所以退出时不会自动还原系统代理。如需接管，请先结束 pid ${found.pid}。${C.r}`);
+      }
+      console.log('');
+      openBrowser(`http://127.0.0.1:${found.uiPort}`);
+      logLine(`检测到已有实例 pid=${found.pid}（${found.via}），打开浏览器后退出。这是正常结束，不是闪退。`);
+      process.exit(0);
+    }
   }
 
   // ---- 端口被别的程序占用？给出明确指引 ----
@@ -325,12 +679,17 @@ async function main() {
   };
 
   if (ARGS.proxy) {
+    // 令牌用来区分"这一次会话"。看门狗只在令牌对得上时才动手，
+    // 避免把下一次运行刚写好的恢复文件误用掉。
+    const token = `${process.pid}-${Date.now().toString(36)}`;
+
     saved = {
       enable: (await regGet('ProxyEnable')) || '0',
       server: await regGet('ProxyServer'),
       override: await regGet('ProxyOverride'),
       at: new Date().toISOString(),
       port: ARGS.port,
+      token,
     };
 
     // 先落盘再改设置：万一改到一半崩了，还能靠这个文件恢复
@@ -347,9 +706,17 @@ async function main() {
     await regSet('ProxyServer', 'REG_SZ', `http://127.0.0.1:${ARGS.port}`);
     await regSet('ProxyOverride', 'REG_SZ', 'localhost;127.*;10.*;172.16.*;192.168.*;<local>');
 
+    // 派看门狗盯着自己。
+    //
+    // 只在"退出时还原"是不够的 —— 实测确认 Windows 上任务管理器结束进程、
+    // 外部 signal、关闭控制台窗口都会让收尾代码完全没机会执行，
+    // 结果就是代理留在已停止的端口上、用户直接上不了网。
+    startWatchdog(token);
+    logLine(`看门狗已派出（token=${token.slice(0, 12)}）`);
+
     console.log(`  ${C.g}✓${C.r} 系统代理已指向 ${C.b}http://127.0.0.1:${ARGS.port}${C.r}`);
     console.log(`  ${C.d}退出本程序时会自动还原（含绕过列表）。${C.r}`);
-    console.log(`  ${C.d}若本窗口被强行杀掉导致断网，双击「还原系统代理.cmd」即可恢复。${C.r}`);
+    console.log(`  ${C.d}即使被强杀或崩溃，看门狗也会兜底还原。${C.r}`);
   }
 
   // ---- 启动服务 ----
@@ -472,5 +839,9 @@ module.exports = {
   readRecovery,
   writeRecovery,
   clearRecovery,
+  stopExistingInstance,
+  replaceExistingInstance,
+  readPidFileInfo,
+  pidAlive,
   RECOVERY_FILE,
 };

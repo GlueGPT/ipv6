@@ -1,14 +1,22 @@
 ==== IPv6 加速器启动日志 ====
-时间: 2026/9/30 21:48:13
+时间: 2026/10/2 19:29:23
 Node: v24.20.0 (C:\Program Files\nodejs\node.exe)
 平台: win32 10.0.26200
 脚本目录: C:\Users\32738\Desktop\ipv6-accelerator
 工作目录: C:\Users\32738\Desktop\ipv6-accelerator
 原始参数: []
 ------------------------------
-[2026-09-30T13:48:13.269Z] launcher.js 开始执行（说明 node 能正常启动、launcher.js 能被读到）
-[2026-09-30T13:48:13.269Z] 解析参数: port=8899 proxy=false open=true 传给 server.js: ["--port","8899"]
-[2026-09-30T13:48:13.270Z] 探测已有实例: pid文件 / 8900 / 8899
-[2026-09-30T13:48:13.270Z] PID 文件: {"service":"ipv6-accelerator","version":"1.0.0","pid":15508,"proxyPort":8899,"uiPort":8900,"host":"127.0.0.1","startedAt":"2026-09-30T13:45:54.311Z"}  进程存活=true
-[2026-09-30T13:48:13.282Z] 检测到已有实例 pid=15508（pid文件），打开浏览器后退出。这是正常结束，不是闪退。
-node exit code: 0 
+[2026-10-02T11:29:23.894Z] launcher.js 开始执行（说明 node 能正常启动、launcher.js 能被读到）
+[2026-10-02T11:29:23.894Z] 解析参数: port=8899 proxy=false open=true 传给 server.js: ["--port","8899"]
+[2026-10-02T11:29:29.962Z] 菜单选择生效: proxy=true elevate=true
+[2026-10-02T11:29:29.963Z] 已具备管理员权限，继续正常启动
+[2026-10-02T11:29:29.964Z] 探测已有实例: pid文件 / 8900 / 8899
+[2026-10-02T11:29:29.965Z] PID 文件: {"service":"ipv6-accelerator","version":"1.0.0","pid":33020,"proxyPort":8899,"uiPort":8900,"host":"127.0.0.1","startedAt":"2026-10-02T11:28:34.935Z"}  进程存活=true
+[2026-10-02T11:29:29.965Z] --elevate：准备停掉旧实例 pid=33020
+[2026-10-02T11:29:30.077Z] 已清理旧 PID 文件
+[2026-10-02T11:29:30.080Z] 端口占用: proxy(8899)=false  ui(8900)=false
+[2026-10-02T11:29:30.329Z] 看门狗已派出（token=1996-muqvrw0）
+[2026-10-02T11:29:30.330Z] 启动 server.js: C:\Users\32738\Desktop\ipv6-accelerator\server.js
+[2026-10-02T11:29:30.336Z] server.js 已派生, pid=28632
+[2026-10-02T11:29:30.338Z] main() 正常返回
+[2026-10-02T11:29:34.409Z] 界面就绪于 8900（pid=28632），打开浏览器

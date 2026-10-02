@@ -23,6 +23,19 @@ const { RouteTable, POLICY, rank } = require('./lib/route');
 const proxy = require('./lib/proxy');
 const { ProxyServer, Socks5Server } = proxy;
 const hosts = require('./lib/hosts');
+const presets = require('./lib/presets');
+const logos = require('./lib/logos');
+
+// 启动即校验：模式的 icon 必须在 logos.js 里有定义。
+// 名字写错时前端只会显示空白图标，不主动检查根本发现不了。
+{
+  const problems = presets.validateIcons(logos);
+  if (problems.length) {
+    console.error('[错误] 平台图标配置有问题：');
+    for (const p of problems) console.error(`  - ${p}`);
+    process.exit(1);
+  }
+}
 
 /**
  * 服务身份标识。
@@ -36,7 +49,7 @@ const VERSION = '1.0.0';
 // 参数
 // ---------------------------------------------------------------------------
 function parseArgs(argv) {
-  const a = { port: 8899, host: '127.0.0.1', policy: POLICY.AUTO, ui: true, socks5: 0, local: null, log: true };
+  const a = { port: 8899, host: '127.0.0.1', policy: POLICY.AUTO, ui: true, socks5: 0, local: null, log: true, systemProxy: false };
   for (let i = 2; i < argv.length; i++) {
     const k = argv[i];
     const v = argv[i + 1];
@@ -46,6 +59,7 @@ function parseArgs(argv) {
     else if (k === '--no-ui') { a.ui = false; }
     else if (k === '--socks5') { a.socks5 = Number(v); i++; }
     else if (k === '--local') { a.local = v; i++; }
+    else if (k === '--system-proxy') { a.systemProxy = true; }
     else if (k === '--quiet' || k === '-q') { a.log = false; }
     else if (k === '--help' || k === '-h') { a.help = true; }
   }
@@ -75,6 +89,7 @@ IPv6 通用下载加速器 —— 本地代理模式
   --policy <p>    上游 IP 策略: auto | v6 | v4 | balance（默认 auto）
   --socks5 <n>    额外监听一个 SOCKS5 端口（默认不开）
   --local <ip>    绑定本机出口地址，例如 2001:da8:e000:9::c90c
+  --system-proxy  声明系统代理已指向本加速器（由启动器传入，用于界面显示状态）
   --no-ui         不提供 Web 界面
   --quiet         少打印日志
 `);
@@ -91,6 +106,10 @@ const ROUTER = new RouteTable({
 
 let PROXY = null;
 let SOCKS = null;
+
+// 由启动器通过 --system-proxy 告知：当前系统代理是不是指向本加速器。
+// 界面用它来显示"浏览器模式"是否已生效。
+let SYSTEM_PROXY_ON = false;
 
 // ---------------------------------------------------------------------------
 // 本机网络环境检测
@@ -342,6 +361,178 @@ async function apiBlock(req, res) {
   json(res, 200, { ok: true, blocked: Array.from(ROUTER.blocked) });
 }
 
+// ---------------------------------------------------------------------------
+// 多模式（一键切换浏览器 / Steam / Epic ...）
+// ---------------------------------------------------------------------------
+
+/** 列出所有模式及其当前状态 */
+async function apiModes(req, res) {
+  const writable = hosts.canWrite();
+  const active = hosts.activeModes();
+  const entries = hosts.listManaged();
+
+  const modes = presets.listModes().map((m) => {
+    const mine = entries.filter((e) => e.mode === m.id);
+    const blocked = m.strategy === 'hosts' && m.requiresAdmin && !writable.ok;
+    return {
+      ...m,
+      active: m.strategy === 'proxy' ? !!SYSTEM_PROXY_ON : mine.length > 0,
+      entryCount: mine.length,
+      available: !blocked,
+      unavailableReason: blocked ? writable.error : null,
+    };
+  });
+
+  json(res, 200, {
+    ok: true,
+    modes,
+    activeModes: active,
+    hostsWritable: writable.ok,
+    hostsError: writable.ok ? null : writable.error,
+    hostsPath: writable.path,
+    proxyAddress: PROXY ? PROXY.address : null,
+    hostEntries: entries.length,
+  });
+}
+
+/**
+ * 应用某个模式。
+ *
+ * 流程：展开域名 → 并发逐个优选 → 合并写入 hosts（保留其他模式）→ 刷 DNS
+ *
+ * 注意这里不做整批无上限并发：域名可能有二三十个，每个都要连多个 CDN 节点，
+ * 一次性打出去容易被 CDN 判成异常流量。用一个小并发池 + 总时间预算控制。
+ */
+async function apiModesApply(req, res) {
+  const body = await readJson(req);
+  const mode = presets.getMode(String(body.mode || ''));
+  if (!mode) return json(res, 400, { ok: false, error: `未知模式: ${body.mode}` });
+
+  // 代理类模式不写 hosts，交给启动器/系统代理开关处理
+  if (mode.strategy === 'proxy') {
+    return json(res, 400, {
+      ok: false,
+      error: '该模式使用本地代理，不需要写 hosts',
+      hint: '把浏览器的 HTTP/HTTPS 代理设为 127.0.0.1:8899，或运行「一键开启系统代理.cmd」。',
+    });
+  }
+
+  const writable = hosts.canWrite();
+  if (!writable.ok) {
+    return json(res, 403, {
+      ok: false,
+      needAdmin: true,
+      error: writable.error,
+      hint: '请关掉本程序，右键「以管理员身份运行」start.cmd，然后再应用这个模式。',
+    });
+  }
+
+  let domains = presets.expandDomains(mode);
+  const roleFilter = body.role ? String(body.role) : null;
+  if (roleFilter) domains = domains.filter((d) => d.role === roleFilter);
+
+  const maxDomains = Math.max(1, Number(body.maxDomains) || 32);
+  domains = domains.slice(0, maxDomains);
+
+  if (!domains.length) return json(res, 400, { ok: false, error: '该模式没有可优选的域名' });
+
+  const doSpeed = body.doSpeed !== false;
+  const t0 = Date.now();
+  const budgetMs = Math.max(10000, Number(body.budgetMs) || 120000);
+  const concurrency = Math.max(1, Number(body.concurrency) || 4);
+
+  const limit = probe.createLimiter(concurrency);
+  const results = [];
+  let timedOut = false;
+
+  await Promise.all(domains.map((d) => limit(async () => {
+    if (Date.now() - t0 > budgetMs) { timedOut = true; results.push({ ...d, ok: false, error: '超出时间预算，跳过' }); return; }
+    try {
+      const cands = await probe.buildCandidates(`https://${d.host}/`, { originPool: ROUTER.originPool });
+      const rows = await probe.probeAll(cands, {
+        doSpeed,
+        concurrency: 6,
+        localAddress: ARGS.local || undefined,
+      });
+      const ranked = rank(rows, { policy: body.policy || ROUTER.policy, blocked: ROUTER.blocked });
+      const best = ranked.find((r) => r.ok);
+      if (!best) return results.push({ ...d, ok: false, error: '没有可用 IP' });
+      results.push({
+        ...d, ok: true, ip: best.ip, family: best.family,
+        latency: best.latency, kbps: best.kbps, reliable: !!best.reliable,
+        candidates: ranked.filter((r) => r.ok).length,
+      });
+    } catch (e) {
+      results.push({ ...d, ok: false, error: e.message });
+    }
+  })));
+
+  const good = results.filter((r) => r.ok && r.ip);
+  if (!good.length) {
+    return json(res, 500, {
+      ok: false,
+      error: '所有域名都没找到可用 IP，hosts 未改动',
+      detail: results,
+      elapsed: Date.now() - t0,
+    });
+  }
+
+  const entries = good.map((r) => ({
+    ip: r.ip,
+    host: r.host,
+    mode: mode.id,
+    role: r.role,
+    comment: `${r.family === 6 ? 'v6' : 'v4'} ${r.latency != null ? r.latency + 'ms' : ''} ${r.reliable && r.kbps ? (r.kbps / 1024).toFixed(1) + 'MB/s' : ''}`.trim(),
+  }));
+
+  // replaceModes 只清掉本模式的旧条目，其他模式保留
+  const w = hosts.apply(entries, { replaceModes: [mode.id], keepOthers: true });
+  if (!w.ok) return json(res, 500, { ok: false, ...w, detail: results });
+
+  const flushed = await hosts.flushDns();
+
+  json(res, 200, {
+    ok: true,
+    mode: mode.id,
+    modeName: mode.name,
+    written: w.count,
+    applied: good.length,
+    failed: results.filter((r) => !r.ok).length,
+    timedOut,
+    elapsed: Date.now() - t0,
+    hostsPath: w.path,
+    dnsFlushed: flushed.ok,
+    detail: results,
+    tip: mode.tip,
+  });
+}
+
+/** 还原某个模式（只移除该模式的条目） */
+async function apiModesRevert(req, res) {
+  const body = await readJson(req);
+  const modeId = body.mode ? String(body.mode) : null;
+
+  if (!modeId) {
+    const r = hosts.revert();
+    if (r.ok) await hosts.flushDns();
+    return json(res, r.ok ? 200 : 500, r);
+  }
+
+  const r = hosts.revertMode(modeId);
+  if (r.ok) await hosts.flushDns();
+  json(res, r.ok ? 200 : 500, r);
+}
+
+/** 当前 hosts 里各模式的明细 */
+async function apiModesEntries(req, res) {
+  json(res, 200, {
+    ok: true,
+    entries: hosts.listManaged(),
+    modes: hosts.activeModes(),
+    writable: hosts.canWrite().ok,
+  });
+}
+
 /** 代理测速：通过自己的代理下载一段，验证端到端生效 */
 async function apiSpeedtest(req, res) {
   const body = await readJson(req);
@@ -444,6 +635,10 @@ function makeUiServer() {
         if (p === '/api/block') return apiBlock(req, res);
         if (p === '/api/hosts') return apiHosts(req, res);
         if (p === '/api/hosts/auto') return apiHostsAuto(req, res);
+        if (p === '/api/modes') return apiModes(req, res);
+        if (p === '/api/modes/apply') return apiModesApply(req, res);
+        if (p === '/api/modes/revert') return apiModesRevert(req, res);
+        if (p === '/api/modes/entries') return apiModesEntries(req, res);
         if (p === '/api/resolve') {
           const b = await readJson(req);
           const r = await probe.resolveHost(String(b.hostname || '').trim());
@@ -461,6 +656,21 @@ function makeUiServer() {
       if (!full.startsWith(path.join(__dirname, 'public'))) { res.writeHead(403); return res.end('forbidden'); }
       if (!fs.existsSync(full) || !fs.statSync(full).isFile()) { res.writeHead(404); return res.end('not found'); }
       const ext = path.extname(full).toLowerCase();
+
+      // 首页需要把平台图标 sprite 注入进去（图标由 lib/logos.js 生成，无外部资源依赖）
+      if (ext === '.html') {
+        let html = fs.readFileSync(full, 'utf8');
+        if (html.includes('<!--LOGOS-->')) {
+          html = html.replace('<!--LOGOS-->', logos.sprite(48));
+        }
+        res.writeHead(200, {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-cache',
+          'content-length': Buffer.byteLength(html),
+        });
+        return res.end(html);
+      }
+
       res.writeHead(200, { 'content-type': MIME[ext] || 'application/octet-stream', 'cache-control': 'no-cache' });
       fs.createReadStream(full).pipe(res);
     } catch (e) {
@@ -507,6 +717,8 @@ function portInUse(port, host) {
 }
 
 async function main() {
+  SYSTEM_PROXY_ON = !!ARGS.systemProxy;
+
   const banner = [
     '',
     `${C.bold}${C.cyan}  IPv6 通用下载加速器${C.reset}  ${C.dim}本地代理模式 · 不改 hosts、不需管理员${C.reset}`,

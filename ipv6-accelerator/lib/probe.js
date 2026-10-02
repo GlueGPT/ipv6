@@ -206,38 +206,69 @@ async function probeThroughput(url, ip, opts = {}) {
     probeMs = 250,
     maxBytes = 64 * 1024 * 1024,
     maxSampleScale = 16,
+    // 单次测速的墙钟上限：慢链路上宁可读数不准，也不能为了测速一直挂着
+    wallClockMs = 4000,
     minTransferMs = 120,
     minBytes = 512 * 1024,
     timeout = 12000,
     localAddress = undefined,
   } = opts;
 
+  const startedAt = Date.now();
   let limit = Math.min(probeBytes, maxBytes);
   let best = null;
 
   for (let attempt = 0; attempt < 2; attempt++) {
-    const r = await once(url, ip, { byteLimit: limit, minBytes, timeout, localAddress });
+    const left = wallClockMs - (Date.now() - startedAt);
+    if (left <= 500) break;   // 时间预算用完了，就用已有结果
 
-    if (!r.ok) return r;
+    const r = await once(url, ip, {
+      byteLimit: limit,
+      minBytes,
+      timeout: Math.min(timeout, left),
+      wallClockMs: left,          // 绝对截止：慢链路上也不能一直挂着
+      localAddress,
+    });
+
+    if (!r.ok) {
+      // 连接被立即拒绝/重置的，重试也是白费时间，直接返回。
+      // 只有"下到一半断掉"这类才值得换更大样本重试。
+      // （真实踩过：新网络下若干候选会被 TLS 层 RST，每个都要等满超时，
+      //   一次优选因此从 0.8 秒膨胀到 50 秒。）
+      const fastFail = [
+        'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH',
+        'EPROTO', 'ERR_SSL_WRONG_VERSION_NUMBER', 'ERR_SSL_PACKET_LENGTH_TOO_LONG',
+      ];
+      if (fastFail.includes(r.error) || attempt > 0) return r;
+      best = r;
+      continue;
+    }
 
     // 传输窗口已经够长，或者样本已经到顶 → 就用这个结果
     const windowOk = r.transferMs != null && r.transferMs >= minTransferMs;
-    if (windowOk || limit >= maxBytes) {
-      return r;
-    }
+    if (windowOk || limit >= maxBytes) return r;
 
-    // 还没到窗口下限：按实测速度推断要下多少字节才能跑满 probeMs，并留出放大余量
     best = r;
+
+    // 关键：放大倍数必须受"剩余时间"约束。
+    // 只按实测速率外推的话，0.2MB/s 的慢链路会被要求下 64MB —— 那是 300 多秒，
+    // 结果每个候选都只能等超时。这里改成"剩余时间能下完多少就下多少"。
     const measured = r.transferMs > 0 ? r.bytes / r.transferMs : 0; // bytes per ms
+    const budgetBytes = measured > 0 ? Math.floor(measured * left * 0.8) : 0;
+
     let next;
     if (measured > 0) {
-      // 目标时长取 probeMs 的 2 倍，避免刚好卡在边界上
-      next = Math.ceil(measured * probeMs * 2);
+      // 想要跑满 probeMs*2，但不超过剩余时间能承载的量
+      next = Math.min(Math.ceil(measured * probeMs * 2), budgetBytes);
     } else {
-      next = limit * 4;
+      next = limit * 2;
     }
+
     // 至少放大 2 倍，最多 maxSampleScale 倍，且不超过硬上限
     next = Math.max(limit * 2, Math.min(next, limit * maxSampleScale, maxBytes));
+
+    // 如果按预算根本下不了更多，就别再试了
+    if (next > budgetBytes && budgetBytes > 0 && budgetBytes < limit * 2) break;
     if (next <= limit) break;
     limit = next;
   }
@@ -245,8 +276,15 @@ async function probeThroughput(url, ip, opts = {}) {
   return best;
 }
 
-/** 单次吞吐测量 */
-function once(url, ip, { byteLimit, minBytes, timeout, localAddress }) {
+/**
+ * 单次吞吐测量。
+ *
+ * 注意 timeout 的语义：Node 的 req.setTimeout 是 **socket 空闲超时**，
+ * 不是总时长超时。慢链路上一直接收到数据（只是很慢）时它永远不会触发。
+ * 所以这里自己拿 wallClockMs 做绝对截止：到点就 finish 并销毁请求。
+ * （真实踩过：0.2MB/s 的候选本该 4 秒截止，实际每个跑了 17.5 秒。）
+ */
+function once(url, ip, { byteLimit, minBytes, timeout, wallClockMs, localAddress }) {
   return new Promise((resolve) => {
     let target;
     try { target = new URL(url); } catch (e) { return resolve({ ok: false, error: 'bad-url' }); }
@@ -255,6 +293,7 @@ function once(url, ip, { byteLimit, minBytes, timeout, localAddress }) {
     const mod = isTls ? https : http;
     const family = net.isIP(ip);
     const t0 = process.hrtime.bigint();
+    const deadlineAt = Date.now() + wallClockMs;
     let ttfb = null;
     let firstByteNs = null;
     let bytes = 0;
@@ -264,6 +303,7 @@ function once(url, ip, { byteLimit, minBytes, timeout, localAddress }) {
     const finish = (extra = {}) => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadline);
 
       let kbps = null;
       let transferMs = null;
@@ -286,9 +326,20 @@ function once(url, ip, { byteLimit, minBytes, timeout, localAddress }) {
         kbps: kbps != null ? Number(kbps.toFixed(1)) : null,
         reliable,
         byteLimit,
+        hitWallClock: deadlineHit,
         ...extra,
       });
     };
+
+    let deadlineHit = false;
+    const deadline = setTimeout(() => {
+      deadlineHit = true;
+      // 到点就收：已经拿到的字节仍然能算出一个（偏低但有参考价值的）速率
+      finish({ ok: bytes > 0, code: lastCode, wallClock: true });
+      try { req.destroy(); } catch (_) {}
+    }, Math.max(200, wallClockMs));
+
+    let lastCode = null;
 
     const req = mod.request({
       protocol: target.protocol,
@@ -311,22 +362,22 @@ function once(url, ip, { byteLimit, minBytes, timeout, localAddress }) {
       rejectUnauthorized: false,
       timeout,
     }, (res) => {
+      lastCode = res.statusCode;
       ttfb = msSince(t0);
       res.on('data', (chunk) => {
         if (firstByteNs === null) firstByteNs = process.hrtime.bigint();
         bytes += chunk.length;
         if (bytes >= byteLimit) {
-          // 先让 finish 把首字节之后的时间算完，再断开
           finish({ ok: true, code: res.statusCode, truncated: true });
           req.destroy();
         }
       });
       res.on('end', () => finish({ ok: true, code: res.statusCode }));
-      res.on('error', (e) => finish({ ok: false, error: e.code || e.message }));
+      res.on('error', (e) => finish({ ok: bytes > 0, code: res.statusCode, error: e.code || e.message }));
     });
 
-    req.on('timeout', () => { req.destroy(); finish({ ok: false, error: 'timeout' }); });
-    req.on('error', (e) => finish({ ok: false, error: e.code || e.message }));
+    req.on('timeout', () => { req.destroy(); finish({ ok: bytes > 0, error: bytes > 0 ? null : 'timeout', timeout: true }); });
+    req.on('error', (e) => finish({ ok: bytes > 0, code: lastCode, error: e.code || e.message }));
     req.end();
   });
 }
@@ -354,7 +405,13 @@ const CALIBRATION_PATHS = [
  * 只看头部（Range 只取前 64KB），代价很小。
  */
 async function calibrateUrl(url, ip, { minBytes = 128 * 1024, timeout = 5000 } = {}) {
-  const r = await once(url, ip, { byteLimit: 64 * 1024, minBytes, timeout, localAddress: undefined });
+  const r = await once(url, ip, {
+    byteLimit: 64 * 1024,
+    minBytes,
+    timeout,
+    wallClockMs: timeout,   // 不传的话会退化成 once 的最小 200ms 截止，把标定下载提前掐断
+    localAddress: undefined,
+  });
   if (!r.ok) return null;
   const okCode = r.code === 200 || r.code === 206;
   if (!okCode) return null;
@@ -447,17 +504,22 @@ function normalizeUrl(target) {
 // ---------------------------------------------------------------------------
 
 /**
- * 对一组候选 IP 跑完整探测：TCP 延迟 → HTTP 吞吐。
+ * 对一组候选 IP 跑完整探测：TCP 延迟 → HTTP 吞吐（两阶段）。
  *
- * @returns {Array} 每个候选的结果，已按吞吐/延迟排序的原始数据
- */
-/**
- * 对一组候选 IP 跑完整探测：TCP 延迟 → HTTP 吞吐。
+ * 阶段一只探延迟，阶段二挑最优的几个测吞吐。这样既有吞吐数据做优选依据，
+ * 又不会被大量注定落选的候选拖慢整体耗时。
  *
  * ports 默认只探目标实际使用的端口。
  * 早期版本会串行试 [443,80,8080,8443]，每个失败都要等满超时，
  * 冷启动时能把首包拖到将近一秒。而代理本来就知道要连哪个端口，
  * 去探其他端口既没有意义，又白白增加延迟。
+ *
+ * @param {object} opts
+ *   speedByteLimit  单次测速最多下载多少字节
+ *   speedTimeout    单次测速超时
+ *   maxSpeedTargets 最多给几个候选测吞吐（按延迟优先选取，默认 6）
+ *   maxPerFamily    每个协议族最多占几个测速名额（默认 3）
+ *   concurrency     并发上限
  *
  * @returns {Array} 每个候选的结果
  */
@@ -468,6 +530,8 @@ async function probeAll(candidates, opts = {}) {
     doSpeed = true,
     speedByteLimit = 4 * 1024 * 1024,
     speedTimeout = 10000,
+    maxSpeedTargets = 6,
+    maxPerFamily = 3,
     concurrency = 16,
     localAddress = undefined,
     onProgress = null,
@@ -501,6 +565,8 @@ async function probeAll(candidates, opts = {}) {
     if (!calibrated) speedUrl = null;  // 标定不出来就别给假数据
   }
 
+  // ---- 阶段一：全部候选只做 TCP 延迟探测 ----
+  // 必须先拿到全部延迟，才知道该给哪几个测吞吐。
   const results = await Promise.all(items.map((item) => limit(async () => {
     const t = await probeTcpParallel(item.ip, tcpPorts, { timeout: tcpTimeout, localAddress });
     const row = {
@@ -515,10 +581,39 @@ async function probeAll(candidates, opts = {}) {
       ttfb: null,
       code: null,
     };
+    done++;
+    if (onProgress) onProgress(done, items.length, row);
+    return row;
+  })));
 
-    // TCP 都不通的 IP，不必再花时间测吞吐
-    if (t.ok && doSpeed && speedUrl) {
-      const s = await probeThroughput(speedUrl, item.ip, {
+  // ---- 阶段二：只给延迟最优的前几个测吞吐 ----
+  //
+  // 为什么必须设上限：每个测速候选都可能等满 speedTimeout。
+  // 目标若有二三十个候选，逐个测下来能到几十秒（真实踩过：
+  // 新网络下若干候选被 TLS 层 RST，一次优选从 0.8 秒膨胀到 50 秒）。
+  // 而吞吐排序只需要知道最优的那几个就够，测一堆注定落选的纯属浪费。
+  if (doSpeed && speedUrl) {
+    const alive = results.filter((r) => r.ok);
+    alive.sort((a, b) => (a.latency || 1e9) - (b.latency || 1e9));
+
+    // 按协议族分配名额，保证 v6/v4 都有代表，否则会被一边占满、无法对比
+    const picked = [];
+    const perFamily = { 4: 0, 6: 0 };
+    for (const r of alive) {
+      if (picked.length >= maxSpeedTargets) break;
+      if (perFamily[r.family] >= maxPerFamily) continue;
+      picked.push(r);
+      perFamily[r.family]++;
+    }
+    // 名额没满就继续补（例如某一族根本没有可用候选）
+    for (const r of alive) {
+      if (picked.length >= maxSpeedTargets) break;
+      if (!picked.includes(r)) picked.push(r);
+    }
+
+    const speedLimiter = createLimiter(Math.max(1, Math.min(4, concurrency)));
+    await Promise.all(picked.map((row) => speedLimiter(async () => {
+      const s = await probeThroughput(speedUrl, row.ip, {
         byteLimit: speedByteLimit,
         timeout: speedTimeout,
         localAddress,
@@ -536,16 +631,13 @@ async function probeAll(candidates, opts = {}) {
       } else {
         row.speedError = s.error;
       }
-    }
-
-    done++;
-    if (onProgress) onProgress(done, items.length, row);
-    return row;
-  })));
+    })));
+  }
 
   // 把标定结果挂在返回值上，调用方可以展示"实际测速用的是哪个地址"
   results.speedUrl = speedUrl;
   results.calibrated = !!calibrated;
+  results.speedTested = results.filter((r) => r.bytes > 0 || r.speedError).length;
   return results;
 }
 
