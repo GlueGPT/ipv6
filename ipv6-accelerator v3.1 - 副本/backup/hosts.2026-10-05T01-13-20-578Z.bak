@@ -1,0 +1,10 @@
+# 用户自己的 hosts
+127.0.0.1  localhost
+::1        localhost
+10.0.0.5   my-nas.local   # 我自己加的内网设备
+
+# ==== IPv6 Accelerator BEGIN ====
+2001:da8:d800:95::110	steampipe.akamaized.net	# v6 20ms 12MB/s [ipv6accel:steam:download]
+2001:da8:d800:95::110	steamcdn-a.akamaihd.net	# v6 21ms [ipv6accel:steam:download]
+2001:da8:e000:8936::97	epicgames-download1.akamaized.net	# v6 2ms [ipv6accel:epic:download]
+# ==== IPv6 Accelerator END ====
