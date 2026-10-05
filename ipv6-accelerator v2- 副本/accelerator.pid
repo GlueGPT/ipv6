@@ -1,0 +1,9 @@
+{
+  "service": "ipv6-accelerator",
+  "version": "1.0.0",
+  "pid": 2960,
+  "proxyPort": 8899,
+  "uiPort": 8900,
+  "host": "127.0.0.1",
+  "startedAt": "2026-10-02T12:58:35.797Z"
+}
