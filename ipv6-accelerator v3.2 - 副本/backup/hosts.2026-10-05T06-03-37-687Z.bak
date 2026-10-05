@@ -1,0 +1,4 @@
+# 用户自己的 hosts
+127.0.0.1  localhost
+::1        localhost
+10.0.0.5   my-nas.local   # 我自己加的内网设备

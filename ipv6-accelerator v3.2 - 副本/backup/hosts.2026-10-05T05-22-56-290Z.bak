@@ -1,0 +1,38 @@
+﻿
+
+
+
+
+
+
+
+
+
+
+
+
+127.0.0.19 akk.gdtstream.com #UsbEAm_DL_Helper
+127.0.0.19 cdn-ali.content.steamchina.com #UsbEAm_DL_Helper
+127.0.0.19 cdn-qc.content.steamchina.com #UsbEAm_DL_Helper
+127.0.0.19 cdn-ws.content.steamchina.com #UsbEAm_DL_Helper
+127.0.0.19 cdn.mileweb.cs.steampowered.com.8686c.com #UsbEAm_DL_Helper
+127.0.0.19 dl.steam.clngaa.com #UsbEAm_DL_Helper
+127.0.0.19 dl1.steam.clngaa.com #UsbEAm_DL_Helper
+127.0.0.19 f86a8fa9-rh.wanwang.space #UsbEAm_DL_Helper
+127.0.0.19 files.steam.nsclouds.cn #UsbEAm_DL_Helper
+127.0.0.19 gstore.val.manlaxy.com #UsbEAm_DL_Helper
+127.0.0.19 gstore.val.smogfly.com #UsbEAm_DL_Helper
+127.0.0.19 lv.queniujq.cn #UsbEAm_DL_Helper
+127.0.0.19 st-dl-eccdnx.tliveapp.com #UsbEAm_DL_Helper
+127.0.0.19 st.dl.bscstorage.net #UsbEAm_DL_Helper
+127.0.0.19 st.dl.eccdnx.com #UsbEAm_DL_Helper
+127.0.0.19 static-gslb-cm.sycontroller.com #UsbEAm_DL_Helper
+127.0.0.19 steampipe.steamcontent.tnkjmec.com #UsbEAm_DL_Helper
+127.0.0.19 xz.pphimalayanrt.com #UsbEAm_DL_Helper
+127.0.0.19 yif.gdtstream.com #UsbEAm_DL_Helper
+
+# ==== IPv6 Accelerator BEGIN ====
+146.75.115.52	cdn.steamstatic.com	# v4 83.6ms [ipv6accel:steam:download]
+127.0.0.1	steamcdn-a.akamaihd.net	# v4 0.5ms [ipv6accel:steam:download]
+23.221.24.202	steampipe.akamaized.net	# v4 193.4ms [ipv6accel:steam:download]
+# ==== IPv6 Accelerator END ====

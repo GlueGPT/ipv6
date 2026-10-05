@@ -1,0 +1,11 @@
+==== IPv6 加速器启动日志 ====
+时间: 2026/10/5 14:03:33
+Node: v24.20.0 (C:\Program Files\nodejs\node.exe)
+平台: win32 10.0.26200
+脚本目录: C:\Users\32738\Desktop\ipv6-accelerator v3.2
+工作目录: C:\Users\32738\Desktop\ipv6-accelerator v3.2
+原始参数: []
+------------------------------
+[2026-10-05T06:03:33.103Z] launcher.js 开始执行（说明 node 能正常启动、launcher.js 能被读到）
+[2026-10-05T06:03:33.104Z] 解析参数: port=8899 proxy=false open=true 传给 server.js: ["--port","8899"]
+[2026-10-05T06:03:36.064Z] 用户在菜单选择退出
